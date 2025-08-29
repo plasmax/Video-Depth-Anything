@@ -1,5 +1,5 @@
 # Video-Depth-Anything for Metric Depth Estimation
-We here provide a simple demo for our fine-tuned Video-Depth-Anything metric model. We fine-tune our pre-trained model on Virtual KITTI and IRS datasets for metric depth estimation. 
+We experimentally fine-tune our pre-trained model on Virtual KITTI and IRS datasets for metric depth estimation. 
 
 # Pre-trained Models
 We provide three models for metric video depth estimation:
