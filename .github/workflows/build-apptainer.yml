@@ -1,0 +1,24 @@
+name: Build Apptainer Image
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Apptainer
+        uses: uw-psych/apptainer-actions/setup@v1
+
+      - name: Build Apptainer image
+        run: apptainer build --fakeroot video-depth.sif Apptainer.def
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-depth-sif
+          path: video-depth.sif
