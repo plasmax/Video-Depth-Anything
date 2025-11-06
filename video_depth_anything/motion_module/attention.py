@@ -17,15 +17,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-try:
-    import xformers
-    import xformers.ops
-
-    XFORMERS_AVAILABLE = True
-except ImportError:
-    print("xFormers not available")
-    XFORMERS_AVAILABLE = False
-
 
 class CrossAttention(nn.Module):
     r"""
@@ -162,15 +153,10 @@ class CrossAttention(nn.Module):
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
         # attention, what we cannot get enough of
-        if XFORMERS_AVAILABLE and self._use_memory_efficient_attention_xformers:
-            hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
-            # Some versions of xformers return output in fp32, cast it back to the dtype of the input
-            hidden_states = hidden_states.to(query.dtype)
+        if self._slice_size is None or query.shape[0] // self._slice_size == 1:
+            hidden_states = self._attention(query, key, value, attention_mask)
         else:
-            if self._slice_size is None or query.shape[0] // self._slice_size == 1:
-                hidden_states = self._attention(query, key, value, attention_mask)
-            else:
-                hidden_states = self._sliced_attention(query, key, value, sequence_length, dim, attention_mask)
+            hidden_states = self._sliced_attention(query, key, value, sequence_length, dim, attention_mask)
 
         # linear proj
         hidden_states = self.to_out[0](hidden_states)
@@ -253,44 +239,6 @@ class CrossAttention(nn.Module):
         hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         return hidden_states
 
-    def _memory_efficient_attention_xformers(self, query, key, value, attention_mask):
-        if self.upcast_efficient_attention:
-            org_dtype = query.dtype
-            query = query.float()
-            key = key.float()
-            value = value.float()
-            if attention_mask is not None:
-                attention_mask = attention_mask.float()
-        hidden_states = self._memory_efficient_attention_split(query, key, value, attention_mask)
-
-        if self.upcast_efficient_attention:
-            hidden_states = hidden_states.to(org_dtype)
-
-        hidden_states = self.reshape_4d_to_heads(hidden_states)
-        return hidden_states
-
-        # print("Errror: no xformers")
-        # raise NotImplementedError
-
-    def _memory_efficient_attention_split(self, query, key, value, attention_mask):
-        batch_size = query.shape[0]
-        max_batch_size = 65535
-        num_batches = (batch_size + max_batch_size - 1) // max_batch_size
-        results = []
-        for i in range(num_batches):
-            start_idx = i * max_batch_size
-            end_idx = min((i + 1) * max_batch_size, batch_size)
-            query_batch = query[start_idx:end_idx]
-            key_batch = key[start_idx:end_idx]
-            value_batch = value[start_idx:end_idx]
-            if attention_mask is not None:
-                attention_mask_batch = attention_mask[start_idx:end_idx]
-            else:
-                attention_mask_batch = None
-            result = xformers.ops.memory_efficient_attention(query_batch, key_batch, value_batch, attn_bias=attention_mask_batch)
-            results.append(result)
-        full_result = torch.cat(results, dim=0)
-        return full_result
 
 
 class FeedForward(nn.Module):

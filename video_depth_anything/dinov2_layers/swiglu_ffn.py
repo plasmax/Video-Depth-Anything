@@ -33,16 +33,11 @@ class SwiGLUFFN(nn.Module):
         return self.w3(hidden)
 
 
-try:
-    from xformers.ops import SwiGLU
-
-    XFORMERS_AVAILABLE = True
-except ImportError:
-    SwiGLU = SwiGLUFFN
-    XFORMERS_AVAILABLE = False
-
-
-class SwiGLUFFNFused(SwiGLU):
+# xformers SwiGLU removed for TorchScript compatibility
+class SwiGLUFFNFused(SwiGLUFFN):
+    """
+    Fused SwiGLU implementation (without xformers for TorchScript compatibility).
+    """
     def __init__(
         self,
         in_features: int,
@@ -59,5 +54,7 @@ class SwiGLUFFNFused(SwiGLU):
             in_features=in_features,
             hidden_features=hidden_features,
             out_features=out_features,
+            act_layer=act_layer,
+            drop=drop,
             bias=bias,
         )

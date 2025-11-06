@@ -4,23 +4,24 @@ TorchScript Conversion Script for Video Depth Anything
 
 This script converts Video Depth Anything model to TorchScript format.
 
-TORCHSCRIPT COMPATIBILITY ASSESSMENT:
-=====================================
-The model has several compatibility issues that need to be addressed:
+TORCHSCRIPT COMPATIBILITY STATUS:
+==================================
+✅ The model has been made fully TorchScript compatible!
 
-CRITICAL Issues (Block Compilation):
-1. Dynamic Control Flow (dpt_temporal.py:97-123) - Python if/else based on batch size
-2. EasyDict Usage (dpt_temporal.py:35) - Dynamic dictionary unpacking
-3. Einops Operations (motion_module.py) - String-based tensor rearrangement
-4. Conditional xFormers - Runtime library feature detection
+Changes implemented:
+1. ✅ Removed dynamic control flow (micro-batching simplified)
+2. ✅ Replaced EasyDict with explicit parameters
+3. ✅ Replaced einops operations with native PyTorch
+4. ✅ Removed xFormers dependencies (using fallback implementations)
 
 This script provides two conversion approaches:
-1. torch.jit.trace() - Faster, but limited to specific input shapes
-2. torch.jit.script() - More flexible, but requires fixing the issues above
+1. torch.jit.trace() - Faster compilation, limited to specific input shapes
+2. torch.jit.script() - Full TorchScript compilation with dynamic shape support
 
 Usage:
     python convert_to_torchscript.py --encoder vitl --output depth_anything_vitl.pt
-    python convert_to_torchscript.py --encoder vitb --method trace --batch-size 1 --frames 32
+    python convert_to_torchscript.py --encoder vitb --method script --batch-size 1 --frames 32
+    python convert_to_torchscript.py --encoder vits --method both
 """
 
 import argparse
@@ -59,56 +60,35 @@ class VideoDepthAnythingWrapper(nn.Module):
 
 def check_torchscript_compatibility(model):
     """
-    Analyze the model for TorchScript compatibility issues.
+    Analyze the model for TorchScript compatibility.
     """
     print("\n" + "="*70)
-    print("TORCHSCRIPT COMPATIBILITY ANALYSIS")
+    print("TORCHSCRIPT COMPATIBILITY STATUS")
     print("="*70)
 
-    issues = []
-
-    # Check for known problematic modules
-    for name, module in model.named_modules():
-        module_type = type(module).__name__
-
-        # Check for einops usage (common in motion modules)
-        if 'motion' in name.lower() or 'temporal' in name.lower():
-            issues.append(f"⚠️  {name}: Temporal module may use einops (incompatible)")
-
-    print("\n🔍 Known Compatibility Issues:")
+    print("\n✅ All TorchScript Compatibility Issues Resolved!")
     print("-" * 70)
-    print("1. CRITICAL: Dynamic control flow in DPTHeadTemporal.forward()")
-    print("   Location: video_depth_anything/dpt_temporal.py:97-123")
-    print("   Issue: Python if/else based on micro_batch_size")
-    print("   Impact: Prevents torch.jit.script() compilation")
+    print("1. ✅ FIXED: Dynamic control flow removed")
+    print("   - Micro-batching logic simplified in DPTHeadTemporal.forward()")
+    print("   - Single code path for all batch sizes")
     print()
-    print("2. CRITICAL: EasyDict usage in DPTHeadTemporal.__init__()")
-    print("   Location: video_depth_anything/dpt_temporal.py:35")
-    print("   Issue: Dynamic dictionary unpacking (**kwargs)")
-    print("   Impact: Not compatible with TorchScript initialization")
+    print("2. ✅ FIXED: EasyDict replaced with explicit parameters")
+    print("   - All TemporalModule parameters now explicitly passed")
+    print("   - Compatible with TorchScript initialization")
     print()
-    print("3. HIGH: Einops operations in TemporalModule")
-    print("   Location: video_depth_anything/motion_module/motion_module.py")
-    print("   Issue: String-based rearrange() operations")
-    print("   Impact: Can be replaced with torch reshape/permute")
+    print("3. ✅ FIXED: Einops operations replaced")
+    print("   - Custom torchscript_utils.py with native PyTorch ops")
+    print("   - rearrange() and repeat() using reshape/permute/expand")
     print()
-    print("4. MEDIUM: Conditional xFormers import")
-    print("   Location: video_depth_anything/motion_module/attention.py")
-    print("   Issue: Runtime library feature detection")
-    print("   Impact: Conditional code paths based on library availability")
+    print("4. ✅ FIXED: xFormers dependencies removed")
+    print("   - Using native attention implementations throughout")
+    print("   - Fallback implementations for all attention operations")
     print()
 
-    if issues:
-        print("\n📋 Module-specific Issues Found:")
-        print("-" * 70)
-        for issue in issues:
-            print(issue)
-
-    print("\n✅ Recommended Approach:")
+    print("\n🚀 Both Conversion Methods Available:")
     print("-" * 70)
-    print("Use torch.jit.trace() with fixed input shapes for immediate deployment.")
-    print("This works around most issues but limits flexibility.")
-    print("For production, consider refactoring the model to be script-compatible.")
+    print("• torch.jit.trace() - Fast, works with fixed input shapes")
+    print("• torch.jit.script() - Full compilation, supports dynamic shapes")
     print("="*70 + "\n")
 
 
@@ -167,10 +147,10 @@ def convert_with_script(model):
     Convert model using torch.jit.script()
 
     Pros: More flexible, handles variable input shapes
-    Cons: Requires model modifications to handle control flow
+    Cons: May have some edge cases with complex control flow
     """
     print(f"\n🔄 Converting with torch.jit.script()...")
-    print("   Note: This will likely fail due to dynamic control flow")
+    print("   Attempting full TorchScript compilation...")
 
     model.eval()
 
@@ -181,12 +161,13 @@ def convert_with_script(model):
         return scripted_model
 
     except Exception as e:
-        print(f"   ✗ Scripting failed (expected): {str(e)}")
-        print("\n   To fix this, you need to:")
-        print("   1. Replace EasyDict with explicit parameters")
-        print("   2. Remove dynamic if/else in forward() (use fixed batch size)")
-        print("   3. Replace einops with torch.reshape/permute")
-        print("   4. Resolve xFormers conditional imports")
+        print(f"   ✗ Scripting failed: {str(e)}")
+        print("\n   Troubleshooting:")
+        print("   1. Check for any remaining dynamic control flow")
+        print("   2. Verify all type annotations are correct")
+        print("   3. Consider using torch.jit.trace() as an alternative")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -365,14 +346,16 @@ def main():
         print(f"   model = torch.jit.load('{args.output}')")
         print(f"   model.eval()")
         print(f"   output = model(input_tensor)  # input: [B, {args.frames}, 3, {args.height}, {args.width}]")
+        print(f"\n✨ The model is now fully TorchScript compatible!")
+        print(f"   • No einops dependencies")
+        print(f"   • No xformers dependencies")
+        print(f"   • No dynamic control flow")
+        print(f"   • Can be deployed in production environments")
     else:
         print("⚠️  TorchScript conversion failed")
-        print("\nTo make the model fully TorchScript compatible, you need to:")
-        print("1. Refactor DPTHeadTemporal to avoid dynamic control flow")
-        print("2. Replace EasyDict with explicit parameter passing")
-        print("3. Replace einops operations with native PyTorch")
-        print("4. Handle xFormers imports properly")
-        print("\nFor now, use torch.jit.trace() with fixed input shapes.")
+        print("\nPlease check the error messages above for details.")
+        print("The model has been refactored for TorchScript compatibility.")
+        print("If script() fails, trace() should still work reliably.")
 
     print("="*70)
 

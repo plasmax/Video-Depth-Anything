@@ -8,18 +8,14 @@ import torch.nn.functional as F
 from torch import nn
 
 from .attention import CrossAttention, FeedForward, apply_rotary_emb, precompute_freqs_cis
-
-from einops import rearrange, repeat
+from ..torchscript_utils import (
+    rearrange_bcfhw_to_bfchw,
+    rearrange_bfchw_to_bcfhw,
+    rearrange_bfdc_to_bdfc,
+    rearrange_bdfc_to_bfdc,
+    repeat_bdc_to_bdnc
+)
 import math
-
-try:
-    import xformers
-    import xformers.ops
-
-    XFORMERS_AVAILABLE = True
-except ImportError:
-    print("xFormers not available")
-    XFORMERS_AVAILABLE = False
 
 
 def zero_module(module):
@@ -104,7 +100,7 @@ class TemporalTransformer3DModel(nn.Module):
         output_hidden_state_list = []
 
         video_length = hidden_states.shape[2]
-        hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
+        hidden_states = rearrange_bcfhw_to_bfchw(hidden_states)
 
         batch, channel, height, width = hidden_states.shape
         residual = hidden_states
@@ -129,7 +125,7 @@ class TemporalTransformer3DModel(nn.Module):
         hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
 
         output = hidden_states + residual
-        output = rearrange(output, "(b f) c h w -> b c f h w", f=video_length)
+        output = rearrange_bfchw_to_bcfhw(output, video_length)
 
         return output, output_hidden_state_list
 
@@ -219,7 +215,6 @@ class TemporalAttention(CrossAttention):
         super().__init__(*args, **kwargs)
 
         self.pos_embedding_type = pos_embedding_type
-        self._use_memory_efficient_attention_xformers = True
 
         self.pos_encoder = None
         self.freqs_cis = None
@@ -247,10 +242,10 @@ class TemporalAttention(CrossAttention):
         d = hidden_states.shape[1]
         d_in = 0
         if cached_hidden_states is None:
-            hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=video_length)
+            hidden_states = rearrange_bfdc_to_bdfc(hidden_states, video_length)
             input_hidden_states = hidden_states  # (bxd) f c
         else:
-            hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=1)
+            hidden_states = rearrange_bfdc_to_bdfc(hidden_states, 1)
             input_hidden_states = hidden_states
             d_in = cached_hidden_states.shape[1]
             hidden_states = torch.cat([cached_hidden_states, hidden_states], dim=1)
@@ -258,7 +253,10 @@ class TemporalAttention(CrossAttention):
         if self.pos_encoder is not None:
             hidden_states = self.pos_encoder(hidden_states)
 
-        encoder_hidden_states = repeat(encoder_hidden_states, "b n c -> (b d) n c", d=d) if encoder_hidden_states is not None else encoder_hidden_states
+        if encoder_hidden_states is not None:
+            encoder_hidden_states = repeat_bdc_to_bdnc(encoder_hidden_states, d)
+        else:
+            encoder_hidden_states = None
 
         if self.group_norm is not None:
             hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
@@ -285,30 +283,16 @@ class TemporalAttention(CrossAttention):
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
 
-        use_memory_efficient = XFORMERS_AVAILABLE and self._use_memory_efficient_attention_xformers
-        if use_memory_efficient and (dim // self.heads) % 8 != 0:
-            # print('Warning: the dim {} cannot be divided by 8. Fall into normal attention'.format(dim // self.heads))
-            use_memory_efficient = False
-
         # attention, what we cannot get enough of
-        if use_memory_efficient:
-            query = self.reshape_heads_to_4d(query)
-            key = self.reshape_heads_to_4d(key)
-            value = self.reshape_heads_to_4d(value)
+        query = self.reshape_heads_to_batch_dim(query)
+        key = self.reshape_heads_to_batch_dim(key)
+        value = self.reshape_heads_to_batch_dim(value)
 
-            hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
-            # Some versions of xformers return output in fp32, cast it back to the dtype of the input
-            hidden_states = hidden_states.to(query.dtype)
+        if self._slice_size is None or query.shape[0] // self._slice_size == 1:
+            hidden_states = self._attention(query, key, value, attention_mask)
         else:
-            query = self.reshape_heads_to_batch_dim(query)
-            key = self.reshape_heads_to_batch_dim(key)
-            value = self.reshape_heads_to_batch_dim(value)
-
-            if self._slice_size is None or query.shape[0] // self._slice_size == 1:
-                hidden_states = self._attention(query, key, value, attention_mask)
-            else:
-                raise NotImplementedError
-                # hidden_states = self._sliced_attention(query, key, value, sequence_length, dim, attention_mask)
+            raise NotImplementedError
+            # hidden_states = self._sliced_attention(query, key, value, sequence_length, dim, attention_mask)
 
         # linear proj
         hidden_states = self.to_out[0](hidden_states)
@@ -316,6 +300,6 @@ class TemporalAttention(CrossAttention):
         # dropout
         hidden_states = self.to_out[1](hidden_states)
 
-        hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
+        hidden_states = rearrange_bdfc_to_bfdc(hidden_states, d)
 
         return hidden_states, input_hidden_states
