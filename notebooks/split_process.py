@@ -27,7 +27,7 @@ Example commands for testing:
 3)
 (cd /job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything && ./py10venv_el9/bin/python ./notebook/split_process.py --export_blocks --output_dir "/job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out" --frame "<SPACEDFRAMELIST>" --start_frame 977 --end_frame 1113)
 4)
-
+(cd /job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything && ./py10venv_el9/bin/python ./notebook/split_process.py --export_exrs --input_path "/job/mlearn/vault/vfx_image_sequence/dev/depthestimation/sdfx/asset_sourceplates/mp01_default_2484x1176_ldn.mlearn.asset.1407801/v002/main/dev_gef056_0670_sourceplates_mp01_v002_main.%04d.exr" --output_dir "/job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out")
 5)
 
 
@@ -254,8 +254,143 @@ class VideoDepthAnything(nn.Module):
         out_path = Path(blocks_dir) / f"block.{frame_step:04d}.pt"
         torch.save(depth, out_path)
 
-    def export_final_exrs(self):
-        pass
+    def export_final_exrs(self, output_dir: str, input_path: str, metric: bool = False) -> None:
+        """Load all temporal blocks, perform alignment and interpolation, and write final depth EXRs.
+
+        Args:
+            output_dir: Directory containing blocks/, rgb/ subdirectories
+            input_path: Original input path (e.g., path/to/frames.%04d.exr) to get frame numbers and resolution
+            metric: If True, skip scale/shift alignment (for metric depth models)
+        """
+        from pathlib import Path
+
+        # 1. Get original frame information
+        file_paths = glob.glob(input_path.replace('%04d', '*').replace('#', '*'))
+        if not file_paths:
+            raise ValueError(f"No input files found matching pattern: {input_path}")
+
+        frame_numbers = sorted([int(f.split(".")[-2]) for f in file_paths])
+        first_frame = frame_numbers[0]
+        last_frame = frame_numbers[-1]
+        org_video_len = len(frame_numbers)
+
+        # Get original resolution from first frame
+        first_frame_data = get_first_frame(input_path)
+        frame_height, frame_width = first_frame_data.shape[:2]
+
+        # 2. Load all blocks from blocks_dir
+        blocks_dir = Path(output_dir) / "blocks"
+        if not blocks_dir.exists():
+            raise ValueError(f"Blocks directory not found: {blocks_dir}")
+
+        block_files = sorted(blocks_dir.glob("block.*.pt"))
+        if not block_files:
+            raise ValueError(f"No block files found in {blocks_dir}")
+
+        # Load blocks and extract frame numbers from filenames
+        blocks_data = []
+        for block_file in block_files:
+            frame_num = int(block_file.stem.split(".")[-1])
+            block_tensor = torch.load(block_file, map_location="cpu", weights_only=True)
+            blocks_data.append((frame_num, block_tensor))
+
+        # Sort by frame number
+        blocks_data.sort(key=lambda x: x[0])
+
+        # 3. Convert blocks to flat depth_list
+        # Each block is [B=1, T=32, H, W], we need to extract individual frames
+        depth_list = []
+        for block_idx, (frame_step, block_tensor) in enumerate(blocks_data):
+            block_tensor = block_tensor.squeeze(0)  # [T, H, W]
+
+            # Get the resized dimensions from the block
+            H, W = block_tensor.shape[1], block_tensor.shape[2]
+
+            # Resize to original dimensions
+            block_resized = F.interpolate(
+                block_tensor.unsqueeze(1),  # [T, 1, H, W]
+                size=(frame_height, frame_width),
+                mode='bilinear',
+                align_corners=True
+            )  # [T, 1, H, W]
+
+            # Convert to list of numpy arrays
+            for i in range(block_resized.shape[0]):
+                depth_list.append(block_resized[i, 0].cpu().numpy())
+
+        # 4. Apply alignment logic (same as infer_video_depth)
+        depth_list_aligned = []
+        ref_align = []
+        align_len = OVERLAP - INTERP_LEN
+        kf_align_list = KEYFRAMES[:align_len]
+
+        for block_idx in range(len(blocks_data)):
+            frame_id = block_idx * INFER_LEN
+
+            if len(depth_list_aligned) == 0:
+                # First block: just add all frames
+                depth_list_aligned += depth_list[:INFER_LEN]
+                for kf_id in kf_align_list:
+                    ref_align.append(depth_list[frame_id + kf_id])
+            else:
+                # Subsequent blocks: apply scale/shift alignment
+                curr_align = []
+                for i in range(len(kf_align_list)):
+                    curr_align.append(depth_list[frame_id + i])
+
+                if metric:
+                    scale, shift = 1.0, 0.0
+                else:
+                    scale, shift = compute_scale_and_shift(
+                        np.concatenate(curr_align),
+                        np.concatenate(ref_align),
+                        np.concatenate(np.ones_like(ref_align) == 1)
+                    )
+
+                # Interpolate overlap region
+                pre_depth_list = depth_list_aligned[-INTERP_LEN:]
+                post_depth_list = depth_list[frame_id + align_len:frame_id + OVERLAP]
+                for i in range(len(post_depth_list)):
+                    post_depth_list[i] = post_depth_list[i] * scale + shift
+                    post_depth_list[i][post_depth_list[i] < 0] = 0
+                depth_list_aligned[-INTERP_LEN:] = get_interpolate_frames(pre_depth_list, post_depth_list)
+
+                # Add remaining frames with scale/shift
+                for i in range(OVERLAP, INFER_LEN):
+                    new_depth = depth_list[frame_id + i] * scale + shift
+                    new_depth[new_depth < 0] = 0
+                    depth_list_aligned.append(new_depth)
+
+                # Update reference alignment
+                ref_align = ref_align[:1]
+                for kf_id in kf_align_list[1:]:
+                    new_depth = depth_list[frame_id + kf_id] * scale + shift
+                    new_depth[new_depth < 0] = 0
+                    ref_align.append(new_depth)
+
+        # Trim to original video length
+        depth_list_aligned = depth_list_aligned[:org_video_len]
+
+        # 5. Write out EXR files
+        output_exr_dir = Path(output_dir) / "depth"
+        output_exr_dir.mkdir(exist_ok=True)
+
+        print(f"Writing {len(depth_list_aligned)} depth EXR files to {output_exr_dir}")
+        for i, (frame_num, depth) in enumerate(zip(frame_numbers, depth_list_aligned)):
+            # Ensure depth is float32 for EXR
+            depth_32 = depth.astype(np.float32)
+
+            # Write EXR file with same naming convention as input
+            output_path = output_exr_dir / f"depth.{frame_num:04d}.exr"
+
+            # OpenCV expects (H, W, C) for multi-channel, but depth is single channel (H, W)
+            # For single-channel, we can save directly
+            cv2.imwrite(str(output_path), depth_32)
+
+            if (i + 1) % 10 == 0:
+                print(f"  Wrote {i + 1}/{len(depth_list_aligned)} frames")
+
+        print(f"✓ Successfully exported {len(depth_list_aligned)} depth EXR files")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """VideoDepthAnything's original forward method. Left here for local/GPU usage."""
@@ -584,7 +719,7 @@ if __name__ == '__main__':
 
         elif args.export_exrs:
             # 4) write out final depth exrs
-            video_depth_anything.export_final_exrs
+            video_depth_anything.export_final_exrs(args.output_dir, args.input_path, args.metric)
 
 
 
