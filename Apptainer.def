@@ -1,47 +1,41 @@
 Bootstrap: docker
-From: nvidia/cuda:12.1.0-devel-ubuntu22.04
-
-%files
-    requirements.txt /
+From: ubuntu:22.04
 
 %post
-    # Update package lists and install core dependencies
+    set -e
+
     apt-get update
     apt-get install -y --no-install-recommends \
-        git \
-        build-essential \
-        python3 \
-        python3-pip \
-        libsm6 \
-        libxext6 \
-        ffmpeg \
-        # Clean up to keep the image small
-    && rm -rf /var/lib/apt/lists/*
+        python3.10 python3.10-venv python3-pip \
+        ca-certificates curl \
+        && rm -rf /var/lib/apt/lists/*
 
-    # Install specific PyTorch and torchvision versions for CUDA 12.1
-    # Note: Use the official PyTorch wheel URL for the correct CUDA version.
-    pip3 install torch==2.1.1 torchvision==0.16.1 --extra-index-url https://download.pytorch.org/whl/cu121
+    python3.10 -m pip install -U pip uv
 
-    # Install xformers separately first, as recommended for stability
-    pip3 install xformers==0.0.23
+    cat > /tmp/requirements.txt <<'EOF'
+numpy==1.24.0
+torch==2.1.1
+torchvision==0.16.1
+opencv-python
+matplotlib
+pillow
+imageio==2.37.0
+imageio-ffmpeg==0.4.7
+decord
+xformers==0.0.23
+einops==0.4.1
+easydict
+tqdm
+OpenEXR==3.3.1
+EOF
 
-    # Install remaining dependencies from requirements.txt
-    pip3 install -r /requirements.txt
-
-    # Symlink python3 to python for convenience
-    ln -s /usr/bin/python3 /usr/bin/python
+    uv pip install --system -r /tmp/requirements.txt
 
 %environment
-    # Set environment variables that your Python script or Apptainer might need
-    export PATH=/usr/bin:$PATH
-    export LC_ALL=C.UTF-8
-    export LANG=C.UTF-8
+    export PYTHONUNBUFFERED=1
 
 %runscript
-    # This script runs when you call 'apptainer run'
-    echo "This container is built for the Video-Depth-Anything project."
-    echo "To run your script, use: apptainer run --nv -B /path/to/your/project:/app video-depth.sif python /app/run.py"
+    exec python3.10 "$@"
 
-%labels
-    Version "1.0"
-    Description "Apptainer container for Video-Depth-Anything project"
+%test
+    python3.10 -c "import torch; print('torch', torch.__version__); print('cuda', torch.cuda.is_available())"
