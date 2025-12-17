@@ -1,12 +1,13 @@
 #!/job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything/py10venv_el9/bin/python
 
 """
-This file separates out VideoDepthAnything's forward method into individual steps in order to test parallelization on the cpu farm.
+This file separates out VideoDepthAnything's forward method into individual steps in order to run in parallel on the cpu farm.
 
-Pre-submission:
-  calculate batch indexes
-  calculate image resolution that the model will process at
-  setup temp directories - rgb, features, blocks
+Submission to farm:
+  Collect frame information - start, end, frame_step.
+  Publish final depth asset, using element: depth
+  Create temp folders - rgb, features, blocks.
+  Create tasks for the below stages.
 
 Farm stages - each requires the previous one be fully completed before it begins:
 1) write out RGB files at that resolution - use preprocess_frames method
@@ -17,35 +18,33 @@ Farm stages - each requires the previous one be fully completed before it begins
 
 This can also be used locally to take advantage of hardware accelerators.
 
-
 Example commands for testing:
 
 1)
-(cd /job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything && ./py10venv_el9/bin/python ./notebook/split_process.py --prep_frames --input_path "/job/mlearn/vault/vfx_image_sequence/dev/depthestimation/sdfx/asset_sourceplates/mp01_default_2484x1176_ldn.mlearn.asset.1407801/v002/main/dev_gef056_0670_sourceplates_mp01_v002_main.%04d.exr" --output_dir "/job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out")
+(cd /job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything && ./py10venv_el9/bin/python run_farm.py --prep_frames --input_path "/job/mlearn/vault/vfx_image_sequence/dev/depthestimation/sdfx/asset_sourceplates/mp01_default_2484x1176_ldn.mlearn.asset.1407801/v002/main/dev_gef056_0670_sourceplates_mp01_v002_main.%04d.exr" --output_dir "/job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out")
 2) 
-(cd /job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything && ./py10venv_el9/bin/python ./notebook/split_process.py --export_features --input_path "/job/mlearn/vault/vfx_image_sequence/dev/depthestimation/sdfx/asset_sourceplates/mp01_default_2484x1176_ldn.mlearn.asset.1407801/v002/main/dev_gef056_0670_sourceplates_mp01_v002_main.%04d.exr" --output_dir "/job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out" --frame "<SPACEDFRAMELIST>")
+(cd /job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything && ./py10venv_el9/bin/python run_farm.py --export_features --output_dir "/job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out" --frame "<SPACEDFRAMELIST>")
 3)
-(cd /job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything && ./py10venv_el9/bin/python ./notebook/split_process.py --export_blocks --output_dir "/job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out" --frame "<SPACEDFRAMELIST>" --start_frame 977 --end_frame 1113)
+(cd /job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything && ./py10venv_el9/bin/python run_farm.py --export_blocks --output_dir "/job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out" --frame "<SPACEDFRAMELIST>" --start_frame 977 --end_frame 1113)
 4)
-(cd /job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything && ./py10venv_el9/bin/python ./notebook/split_process.py --export_exrs --input_path "/job/mlearn/vault/vfx_image_sequence/dev/depthestimation/sdfx/asset_sourceplates/mp01_default_2484x1176_ldn.mlearn.asset.1407801/v002/main/dev_gef056_0670_sourceplates_mp01_v002_main.%04d.exr" --output_dir "/job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out")
+(cd /job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything && ./py10venv_el9/bin/python run_farm.py --export_exrs --input_path "/job/mlearn/vault/vfx_image_sequence/dev/depthestimation/sdfx/asset_sourceplates/mp01_default_2484x1176_ldn.mlearn.asset.1407801/v002/main/dev_gef056_0670_sourceplates_mp01_v002_main.%04d.exr" --output_dir "/job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out")
 5)
-
+(cd /job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything && ./py10venv_el9/bin/python run_farm.py --cleanup_temp --output_dir "/job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out")
 
 """
 
 import sys
 import os
 import glob
+import shutil
 
-# TODO: remove hard coded path before deploying, video_depth_anything module will be available on PATH.
-sys.path.append("/job/mlearn/dev/sandbox/sandbox_mlast/work/mlast/git/Video-Depth-Anything/")
 from typing import Optional, Sequence, Tuple, Union, List
 from pathlib import Path
 import argparse
 
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.transforms import Compose
 import cv2
 from tqdm import tqdm
@@ -57,7 +56,8 @@ from video_depth_anything.dpt_temporal import DPTHeadTemporal
 from video_depth_anything.util.transform import Resize, NormalizeImage, PrepareForNet
 
 from utils.util import compute_scale_and_shift, get_interpolate_frames
-from utils.fast_exr_reader import read_exr_sequence, get_first_frame
+from utils.fast_exr_reader import read_exr_sequence
+from utils.preprocess_frames import preprocess_frames
 
 
 # Type alias: per-layer (patch_tokens, class_token)
@@ -76,7 +76,7 @@ FRAME_STEP = INFER_LEN - OVERLAP
 class VideoDepthAnything(nn.Module):
     def __init__(
         self,
-        encoder='vitl',
+        encoder='vits',
         features=256,
         out_channels=[256, 512, 1024, 1024],
         use_bn=False,
@@ -99,58 +99,14 @@ class VideoDepthAnything(nn.Module):
         self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
         self.metric = metric
 
-    def preprocess_frames(self, input_path: str, output_dir: Optional[str] = None, input_size: int = 518) -> None:
+    def preprocess_frames(self, input_path: str, output_dir: Optional[str] = None, input_size: int = 518, start_frame: Optional[int] = None, end_frame: Optional[int] = None) -> None:
         """Export exrs at the resolution they will be processed by the model.
 
         input_path: e.g. /job/mlearn/vault/vfx_image_sequence/dev/depthestimation/sdfx/asset_sourceplates/mp01_default_2484x1176_ldn.mlearn.asset.1407801/v002/main/dev_gef056_0670_sourceplates_mp01_v002_main.%04d.exr
         output_dir: e.g. /job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out
         
         """
-        path = input_path.replace('%04d', '*').replace('#', '*')
-        file_paths = glob.glob(input_path.replace('%04d', '*').replace('#', '*'))
-        frame_numbers = sorted([int(f.split(".")[-2]) for f in file_paths])
-
-        cpus = os.getenv("FQ_CPUS", None)
-        if cpus is not None:
-            cpus = int(cpus)
-        frames = read_exr_sequence(input_path, max_workers=cpus)
-
-        frame_height, frame_width = frames[0].shape[:2]
-        ratio = max(frame_height, frame_width) / min(frame_height, frame_width)
-        if ratio > 1.78:  # we recommend to process video with ratio smaller than 16:9 due to memory limitation
-            input_size = int(input_size * 1.777 / ratio)
-            input_size = round(input_size / 14) * 14
-
-        transform = Compose([
-            Resize(
-                width=input_size,
-                height=input_size,
-                resize_target=False,
-                keep_aspect_ratio=True,
-                ensure_multiple_of=14,
-                resize_method='lower_bound',
-                image_interpolation_method=cv2.INTER_CUBIC,
-            ),
-            NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            PrepareForNet(),
-        ])
-
-        frame_list = []
-        for i in range(frames.shape[0]):
-            frame = torch.from_numpy(transform({'image': frames[i].astype(np.float32) / 255.0})['image']).unsqueeze(0).unsqueeze(0)
-            frame_list.append(frame)
-
-        # write .pt files to the temp folder
-        if output_dir is not None:
-            if os.path.exists(output_dir):
-                features_dir = os.path.join(output_dir, "rgb")
-                os.makedirs(features_dir, exist_ok=True)
-                for i, data in zip(frame_numbers, frame_list):
-                    out_path = f"{features_dir}/rgb.{i:04d}.pt"
-                    print(out_path)
-                    torch.save(data, out_path)
-
-        return torch.cat(frame_list, dim=1) # leave this here for now so we can verify tensor sizes for the next step
+        preprocess_frames(input_path, output_dir=output_dir, input_size=input_size, start_frame=start_frame, end_frame=end_frame)
 
     def export_features(self, output_dir: str, frame: int) -> None:
         """Write out features as .pt files to the specified by out_path.
@@ -205,6 +161,8 @@ class VideoDepthAnything(nn.Module):
         os.makedirs(features_dir, exist_ok=True)
         out_path = f"{features_dir}/features.{frame:04d}.pt"
         torch.save(features, out_path)
+
+        print(f"Features exported for frame {args.frame}.")
     
     def export_temporal_block(self, output_dir: str, frame_step: int, first_frame: int, last_frame: int) -> None:
 
@@ -254,15 +212,11 @@ class VideoDepthAnything(nn.Module):
         out_path = Path(blocks_dir) / f"block.{frame_step:04d}.pt"
         torch.save(depth, out_path)
 
-    def export_final_exrs(self, output_dir: str, input_path: str, metric: bool = False) -> None:
+    def export_final_exrs(self, input_path: str, publish_path: str, temp_dir: str,  metric: bool = False) -> None:
         """Load all temporal blocks, perform alignment and interpolation, and write final depth EXRs.
-
-        Args:
-            output_dir: Directory containing blocks/, rgb/ subdirectories
-            input_path: Original input path (e.g., path/to/frames.%04d.exr) to get frame numbers and resolution
-            metric: If True, skip scale/shift alignment (for metric depth models)
+        
+        Memory-optimized: keeps depth maps at native resolution until final write.
         """
-        from pathlib import Path
 
         # 1. Get original frame information
         file_paths = glob.glob(input_path.replace('%04d', '*').replace('#', '*'))
@@ -275,11 +229,11 @@ class VideoDepthAnything(nn.Module):
         org_video_len = len(frame_numbers)
 
         # Get original resolution from first frame
-        first_frame_data = get_first_frame(input_path)
-        frame_height, frame_width = first_frame_data.shape[:2]
+        first_frame_data = read_exr_sequence(input_path, num_frames=1, max_workers=1)
+        _, frame_height, frame_width, _ = first_frame_data.shape
 
         # 2. Load all blocks from blocks_dir
-        blocks_dir = Path(output_dir) / "blocks"
+        blocks_dir = Path(temp_dir) / "blocks"
         if not blocks_dir.exists():
             raise ValueError(f"Blocks directory not found: {blocks_dir}")
 
@@ -294,49 +248,44 @@ class VideoDepthAnything(nn.Module):
             block_tensor = torch.load(block_file, map_location="cpu", weights_only=True)
             blocks_data.append((frame_num, block_tensor))
 
-        # Sort by frame number
         blocks_data.sort(key=lambda x: x[0])
+        block_count = len(blocks_data)
 
-        # 3. Convert blocks to flat depth_list
-        # Each block is [B=1, T=32, H, W], we need to extract individual frames
+        # FQ_PROGRESS
+        total = block_count * 2 + org_video_len
+        done = 0
+
+        # 3. Convert blocks to flat depth_list - KEEP AT NATIVE RESOLUTION
         depth_list = []
         for block_idx, (frame_step, block_tensor) in enumerate(blocks_data):
             block_tensor = block_tensor.squeeze(0)  # [T, H, W]
+            
+            # Store each frame as a tensor at native resolution
+            for i in range(block_tensor.shape[0]):
+                depth_list.append(block_tensor[i].clone())  # [H, W] tensor
 
-            # Get the resized dimensions from the block
-            H, W = block_tensor.shape[1], block_tensor.shape[2]
+            done += 1
+            print(f"FQ_PROGRESS {int(done / total * 100)}%", flush=True)
 
-            # Resize to original dimensions
-            block_resized = F.interpolate(
-                block_tensor.unsqueeze(1),  # [T, 1, H, W]
-                size=(frame_height, frame_width),
-                mode='bilinear',
-                align_corners=True
-            )  # [T, 1, H, W]
-
-            # Convert to list of numpy arrays
-            for i in range(block_resized.shape[0]):
-                depth_list.append(block_resized[i, 0].cpu().numpy())
-
-        # 4. Apply alignment logic (same as infer_video_depth)
+        # 4. Apply alignment logic at native resolution
         depth_list_aligned = []
         ref_align = []
         align_len = OVERLAP - INTERP_LEN
         kf_align_list = KEYFRAMES[:align_len]
 
-        for block_idx in range(len(blocks_data)):
+        for block_idx in range(block_count):
             frame_id = block_idx * INFER_LEN
 
             if len(depth_list_aligned) == 0:
                 # First block: just add all frames
-                depth_list_aligned += depth_list[:INFER_LEN]
+                depth_list_aligned += [d.clone() for d in depth_list[:INFER_LEN]]
                 for kf_id in kf_align_list:
-                    ref_align.append(depth_list[frame_id + kf_id])
+                    ref_align.append(depth_list[frame_id + kf_id].numpy())
             else:
                 # Subsequent blocks: apply scale/shift alignment
                 curr_align = []
                 for i in range(len(kf_align_list)):
-                    curr_align.append(depth_list[frame_id + i])
+                    curr_align.append(depth_list[frame_id + i].numpy())
 
                 if metric:
                     scale, shift = 1.0, 0.0
@@ -347,192 +296,65 @@ class VideoDepthAnything(nn.Module):
                         np.concatenate(np.ones_like(ref_align) == 1)
                     )
 
-                # Interpolate overlap region
-                pre_depth_list = depth_list_aligned[-INTERP_LEN:]
-                post_depth_list = depth_list[frame_id + align_len:frame_id + OVERLAP]
+                # Interpolate overlap region (convert to numpy for interpolation)
+                pre_depth_list = [d.numpy() for d in depth_list_aligned[-INTERP_LEN:]]
+                post_depth_list = [depth_list[frame_id + align_len + i].numpy() 
+                                for i in range(INTERP_LEN)]
+                
                 for i in range(len(post_depth_list)):
                     post_depth_list[i] = post_depth_list[i] * scale + shift
                     post_depth_list[i][post_depth_list[i] < 0] = 0
-                depth_list_aligned[-INTERP_LEN:] = get_interpolate_frames(pre_depth_list, post_depth_list)
+                
+                interpolated = get_interpolate_frames(pre_depth_list, post_depth_list)
+                # Convert back to tensors
+                depth_list_aligned[-INTERP_LEN:] = [torch.from_numpy(d) for d in interpolated]
 
                 # Add remaining frames with scale/shift
                 for i in range(OVERLAP, INFER_LEN):
-                    new_depth = depth_list[frame_id + i] * scale + shift
+                    new_depth = depth_list[frame_id + i].numpy() * scale + shift
                     new_depth[new_depth < 0] = 0
-                    depth_list_aligned.append(new_depth)
+                    depth_list_aligned.append(torch.from_numpy(new_depth))
 
                 # Update reference alignment
                 ref_align = ref_align[:1]
                 for kf_id in kf_align_list[1:]:
-                    new_depth = depth_list[frame_id + kf_id] * scale + shift
+                    new_depth = depth_list[frame_id + kf_id].numpy() * scale + shift
                     new_depth[new_depth < 0] = 0
                     ref_align.append(new_depth)
 
+            done += 1
+            print(f"FQ_PROGRESS {int(done / total * 100)}%", flush=True)
+
         # Trim to original video length
         depth_list_aligned = depth_list_aligned[:org_video_len]
+        
+        # Free the unaligned list
+        del depth_list
 
-        # 5. Write out EXR files
-        output_exr_dir = Path(output_dir) / "depth"
-        output_exr_dir.mkdir(exist_ok=True)
+        print(f"Writing depth EXR files to {publish_path}")
+        for i, (frame_num, depth_tensor) in enumerate(zip(frame_numbers, depth_list_aligned)):
+            # Resize to original resolution at write time
+            depth_resized = F.interpolate(
+                depth_tensor.unsqueeze(0).unsqueeze(0),  # [1, 1, H, W]
+                size=(frame_height, frame_width),
+                mode='bilinear',
+                align_corners=True
+            ).squeeze().numpy().astype(np.float32)
 
-        print(f"Writing {len(depth_list_aligned)} depth EXR files to {output_exr_dir}")
-        for i, (frame_num, depth) in enumerate(zip(frame_numbers, depth_list_aligned)):
-            # Ensure depth is float32 for EXR
-            depth_32 = depth.astype(np.float32)
+            # output_path = output_exr_dir / f"depth.{frame_num:04d}.exr"
+            output_path = publish_path % frame_num
+            cv2.imwrite(str(output_path), depth_resized)
 
-            # Write EXR file with same naming convention as input
-            output_path = output_exr_dir / f"depth.{frame_num:04d}.exr"
-
-            # OpenCV expects (H, W, C) for multi-channel, but depth is single channel (H, W)
-            # For single-channel, we can save directly
-            cv2.imwrite(str(output_path), depth_32)
+            # Clear reference to allow GC
+            depth_list_aligned[i] = None
 
             if (i + 1) % 10 == 0:
-                print(f"  Wrote {i + 1}/{len(depth_list_aligned)} frames")
+                print(f"  Wrote {i + 1}/{org_video_len} frames")
 
-        print(f"✓ Successfully exported {len(depth_list_aligned)} depth EXR files")
+            done += 1
+            print(f"FQ_PROGRESS {int(done / total * 100)}%", flush=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """VideoDepthAnything's original forward method. Left here for local/GPU usage."""
-        B, T, C, H, W = x.shape
-        patch_h, patch_w = H // 14, W // 14
-        features = self.pretrained.get_intermediate_layers(x.flatten(0,1), self.intermediate_layer_idx[self.encoder], return_class_token=True)
-        depth = self.head(features, patch_h, patch_w, T)[0]
-        depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
-        depth = F.relu(depth)
-        return depth.squeeze(1).unflatten(0, (B, T)) # return shape [B, T, H, W]
-
-    def infer_video_depth(self, frames, target_fps, input_size=518, device='cuda', fp32=False):
-        """VideoDepthAnything's original infer_video_depth method. Left here for local/GPU usage."""
-        frame_height, frame_width = frames[0].shape[:2]
-        ratio = max(frame_height, frame_width) / min(frame_height, frame_width)
-        if ratio > 1.78:  # we recommend to process video with ratio smaller than 16:9 due to memory limitation
-            input_size = int(input_size * 1.777 / ratio)
-            input_size = round(input_size / 14) * 14
-
-        transform = Compose([
-            Resize(
-                width=input_size,
-                height=input_size,
-                resize_target=False,
-                keep_aspect_ratio=True,
-                ensure_multiple_of=14,
-                resize_method='lower_bound',
-                image_interpolation_method=cv2.INTER_CUBIC,
-            ),
-            NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            PrepareForNet(),
-        ])
-
-        frame_list = [frames[i] for i in range(frames.shape[0])]
-        org_video_len = len(frame_list)
-        append_frame_len = (FRAME_STEP - (org_video_len % FRAME_STEP)) % FRAME_STEP + (INFER_LEN - FRAME_STEP)
-        frame_list = frame_list + [frame_list[-1].copy()] * append_frame_len
-
-        depth_list = []
-        pre_input = None
-        for frame_id in tqdm(range(0, org_video_len, FRAME_STEP)):
-            cur_list = []
-            for i in range(INFER_LEN):
-                cur_frame = torch.from_numpy(transform({'image': frame_list[frame_id+i].astype(np.float32) / 255.0})['image']).unsqueeze(0).unsqueeze(0)
-                print(cur_frame.shape, cur_frame.dtype, cur_frame.device)
-                cur_list.append(cur_frame)
-            cur_input = torch.cat(cur_list, dim=1).to(device)
-            print(FRAME_STEP, cur_input.shape)
-            if pre_input is not None:
-                cur_input[:, :OVERLAP, ...] = pre_input[:, KEYFRAMES, ...] # TODO: if we want to batch this on the farm, this logic should be moved to the exr reading step.
-
-            with torch.no_grad():
-                with torch.autocast(device_type=device, enabled=(not fp32)):
-                    depth = self.forward(cur_input) # depth shape: [1, T, H, W]
-
-            depth = depth.to(cur_input.dtype)
-            depth = F.interpolate(depth.flatten(0,1).unsqueeze(1), size=(frame_height, frame_width), mode='bilinear', align_corners=True)
-            depth_list += [depth[i][0].cpu().numpy() for i in range(depth.shape[0])]
-
-            pre_input = cur_input
-
-        del frame_list
-        gc.collect()
-
-        depth_list_aligned = []
-        ref_align = []
-        align_len = OVERLAP - INTERP_LEN
-        kf_align_list = KEYFRAMES[:align_len]
-
-        for frame_id in range(0, len(depth_list), INFER_LEN):
-            if len(depth_list_aligned) == 0:
-                depth_list_aligned += depth_list[:INFER_LEN]
-                for kf_id in kf_align_list:
-                    ref_align.append(depth_list[frame_id+kf_id])
-            else:
-                curr_align = []
-                for i in range(len(kf_align_list)):
-                    curr_align.append(depth_list[frame_id+i])
-
-                if self.metric:
-                    scale, shift = 1.0, 0.0
-                else:
-                    scale, shift = compute_scale_and_shift(np.concatenate(curr_align),
-                                                           np.concatenate(ref_align),
-                                                           np.concatenate(np.ones_like(ref_align)==1))
-
-                pre_depth_list = depth_list_aligned[-INTERP_LEN:]
-                post_depth_list = depth_list[frame_id+align_len:frame_id+OVERLAP]
-                for i in range(len(post_depth_list)):
-                    post_depth_list[i] = post_depth_list[i] * scale + shift
-                    post_depth_list[i][post_depth_list[i]<0] = 0
-                depth_list_aligned[-INTERP_LEN:] = get_interpolate_frames(pre_depth_list, post_depth_list)
-
-                for i in range(OVERLAP, INFER_LEN):
-                    new_depth = depth_list[frame_id+i] * scale + shift
-                    new_depth[new_depth<0] = 0
-                    depth_list_aligned.append(new_depth)
-
-                ref_align = ref_align[:1]
-                for kf_id in kf_align_list[1:]:
-                    new_depth = depth_list[frame_id+kf_id] * scale + shift
-                    new_depth[new_depth<0] = 0
-                    ref_align.append(new_depth)
-
-        depth_list = depth_list_aligned
-
-        return np.stack(depth_list[:org_video_len], axis=0), target_fps
-
-
-
-def get_chunk_structure(total_frames):
-    # Handle padding logic exactly as in the original code
-    append_frame_len = (FRAME_STEP - (total_frames % FRAME_STEP)) % FRAME_STEP + (INFER_LEN - FRAME_STEP)
-    padded_len = total_frames + append_frame_len
-    
-    # Create list of actual video indices (use -1 or similar to denote padded frames if needed, 
-    # or just clamp to total_frames-1)
-    all_indices = list(range(total_frames)) + [total_frames - 1] * append_frame_len
-    
-    chunks = []
-    prev_chunk_indices = None
-    
-    # Simulate the sliding window
-    for frame_id in range(0, total_frames, FRAME_STEP):
-        # 1. Get the "New" frames for this window
-        # In the original code, this comes from frame_list[frame_id : frame_id+INFER_LEN]
-        # BUT, the first OVERLAP frames are immediately overwritten if prev exists.
-        # So we really only care about the tail.
-        curr_chunk_indices = all_indices[frame_id : frame_id + INFER_LEN]
-        
-        # 2. Apply Keyframe injection from previous chunk
-        if prev_chunk_indices is not None:
-            # Construct the context part
-            context_indices = [prev_chunk_indices[k] for k in KEYFRAMES]
-            # Overwrite the first OVERLAP frames
-            curr_chunk_indices[:OVERLAP] = context_indices
-            
-        chunks.append(curr_chunk_indices)
-        prev_chunk_indices = curr_chunk_indices
-        
-    return chunks
-
+        print(f"Successfully exported all {org_video_len} exr files.")
 
 def _clamp_frame(f: int, first_frame: int, last_frame: int) -> int:
     if f < first_frame:
@@ -650,35 +472,27 @@ def load_and_stack_temporal_features(
     return tuple(out)
 
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Video Depth Anything')
     parser.add_argument('--input_path', type=str)
-    parser.add_argument('--output_dir', type=str, default='./outputs')
-    parser.add_argument('--output_feature_path', type=str)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--input_size', type=int, default=518)
+    parser.add_argument('--publish_path', type=str)
+    parser.add_argument('--output_dir', type=str)
+    parser.add_argument('--temp_dir', type=str)
     parser.add_argument('--frame', type=int)
-    parser.add_argument('--encoder', type=str, default='vitl', choices=['vits', 'vitb', 'vitl'])
-    parser.add_argument('--target_fps', type=int, default=-1, help='target fps of the input video, -1 means the original fps')
-    parser.add_argument('--metric', action='store_true', help='use metric model')
-    parser.add_argument('--fp32', action='store_true', help='model infer with torch.float32, default is torch.float16')
-    parser.add_argument('--autocrop', action='store_true', help='crop black bars')
     parser.add_argument('--start_frame', type=int)
     parser.add_argument('--end_frame', type=int)
+    parser.add_argument('--metric', action='store_true', help='use metric model')
 
     # stages. these will be broken into individual files
-    parser.add_argument('--plan', action='store_true', help='Planning/job prep stage')
     parser.add_argument('--prep_frames', action='store_true', help='Prepare/resize frames')
     parser.add_argument('--export_features', action='store_true', help='')
     parser.add_argument('--export_blocks', action='store_true', help='')
     parser.add_argument('--export_exrs', action='store_true', help='')
+    parser.add_argument('--cleanup_temp', action='store_true', help='')
 
     args = parser.parse_args()
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    INPUT_PATH = "/job/mlearn/vault/vfx_image_sequence/dev/depthestimation/sdfx/asset_sourceplates/mp01_default_2484x1176_ldn.mlearn.asset.1407801/v002/main/dev_gef056_0670_sourceplates_mp01_v002_main.%04d.exr"
-    TEMP_DIR = "/job/mlearn/dev/depthestimation/VideoDepthAnything_Test01/work/mlast/python/temp_out"
 
     model_configs = {
         'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -688,38 +502,24 @@ if __name__ == '__main__':
     encoder = "vits"
     checkpoint_name = 'metric_video_depth_anything' if args.metric else 'video_depth_anything'
 
-    if args.plan:
-        # Pre-submission:
-        #   calculate batch indexes
-        #   calculate image resolution that the model will process at
-        #   setup temp directories - rgb, features, blocks
+    video_depth_anything = VideoDepthAnything(**model_configs[encoder], metric=args.metric)
+    if args.prep_frames:
+        # 1) write out RGB files at that resolution - use preprocess_frames method
+        frames = video_depth_anything.preprocess_frames(args.input_path, output_dir=args.output_dir, start_frame=args.start_frame, end_frame=args.end_frame)
 
-        # Set up farm stages - each requires the previous one be fully completed before it begins:
+    elif args.export_features:
+        # 2) write out .pt feature files to features temp folder (one task per frame)
+        video_depth_anything.export_features(args.output_dir, args.frame)
 
-        chunks = get_chunk_structure(127)
-        from pprint import pprint
-        pprint(chunks)
-        # Chunk 0 needs frames: [0, 1, ..., 31]
-        # Chunk 1 needs frames: [0, 12, 24..., 32, 33...]
-    else:
-        video_depth_anything = VideoDepthAnything(**model_configs[encoder], metric=args.metric)
-        if args.prep_frames:
-            # 1) write out RGB files at that resolution - use preprocess_frames method
-            frames = video_depth_anything.preprocess_frames(args.input_path, args.output_dir)
-            print(frames.shape)
+    elif args.export_blocks:
+        # 3) write out .pt 32-frame blocks to blocks temp folder (one task, unfortunately needs to be done sequentially)
+        video_depth_anything.export_temporal_block(args.output_dir, args.frame, args.start_frame, args.end_frame)
 
-        elif args.export_features:
-            # 2) write out .pt feature files to features temp folder (one task per frame)
-            video_depth_anything.export_features(args.output_dir, args.frame)
-            print(f"block exported for frame {args.frame}")
+    elif args.export_exrs:
+        # 4) write out final depth exrs
+        video_depth_anything.export_final_exrs(args.input_path, args.publish_path, args.temp_dir, metric=args.metric)
 
-        elif args.export_blocks:
-            # 3) write out .pt 32-frame blocks to blocks temp folder (one task, unfortunately needs to be done sequentially)
-            video_depth_anything.export_temporal_block(args.output_dir, args.frame, args.start_frame, args.end_frame)
-
-        elif args.export_exrs:
-            # 4) write out final depth exrs
-            video_depth_anything.export_final_exrs(args.output_dir, args.input_path, args.metric)
-
-
+    elif args.cleanup_temp:
+        print(f"Deleting temp directory {args.output_dir}")
+        shutil.rmtree(args.output_dir, ignore_errors=True)
 
