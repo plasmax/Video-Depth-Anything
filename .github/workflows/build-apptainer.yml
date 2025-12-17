@@ -38,7 +38,7 @@ jobs:
           apptainer version # Verify installation
 
       - name: Build Apptainer image
-        run: apptainer build --fakeroot video-depth.sif Apptainer.def
+        run: sudo apptainer build video-depth.sif Apptainer.def
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
