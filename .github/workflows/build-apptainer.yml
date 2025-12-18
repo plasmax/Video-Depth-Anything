@@ -11,31 +11,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Apptainer dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            uuid-dev \
-            libgpgme-dev \
-            squashfs-tools \
-            libseccomp-dev \
-            wget \
-            pkg-config \
-            git \
-            cryptsetup-bin \
-            golang-go
-
-      - name: Build and Install Apptainer from source
-        env:
-          GO_VERSION: '1.22' # Use a modern Go version
-        run: |
-          git clone https://github.com/apptainer/apptainer.git
-          cd apptainer
-          ./mconfig --without-suid
-          make -C builddir
-          sudo make -C builddir install
-          apptainer version # Verify installation
+      - name: Install Apptainer
+        uses: eWaterCycle/setup-apptainer@v2
+        with:
+          apptainer-version: 1.3.6
 
       - name: Build Apptainer image
         run: sudo apptainer build video-depth.sif Apptainer.def
