@@ -16,7 +16,7 @@ From: ubuntu:22.04
 numpy==1.24.0
 torch==2.1.1
 torchvision==0.16.1
-opencv-python
+opencv-python==4.11.0.86
 matplotlib
 pillow
 imageio==2.37.0
