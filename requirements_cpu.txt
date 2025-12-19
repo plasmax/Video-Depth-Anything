@@ -1,0 +1,11 @@
+numpy==1.24.1
+
+# CPU torch 2.4.0
+torch @ https://download.pytorch.org/whl/cpu/torch-2.4.0%2Bcpu-cp310-cp310-linux_x86_64.whl
+torchvision @ https://download.pytorch.org/whl/cpu/torchvision-0.19.0%2Bcpu-cp310-cp310-linux_x86_64.whl
+
+einops==0.8.0
+opencv-python==4.11.0.86
+easydict
+tqdm==4.67.1
+OpenEXR==3.3.1
