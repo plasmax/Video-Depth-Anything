@@ -2,9 +2,9 @@ import os
 import glob
 import argparse
 import numpy as np
-os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
-import cv2
-import torch
+import OpenEXR
+import Imath
+from PIL import Image
 from concurrent.futures import ProcessPoolExecutor
 from typing import Optional
 from functools import partial
@@ -18,12 +18,12 @@ def preprocess_frames(
     end_frame: Optional[int] = None,
 ) -> None:
     """Export EXRs at the resolution they will be processed by the model.
-    
+
     Memory-efficient: only keeps as many frames in memory as there are CPU threads.
-    
+
     Args:
         input_path: Path pattern with %04d or # for frame number
-        output_dir: Directory to write .pt files
+        output_dir: Directory to write .exr files
         input_size: Target size for model input
         start_frame: First frame to process (inclusive). None = first available.
         end_frame: Last frame to process (inclusive). None = last available.
@@ -120,29 +120,41 @@ def _compute_transform_params(height: int, width: int, input_size: int) -> dict:
 
 def _read_exr_frame(path: str) -> np.ndarray:
     """Read and convert a single EXR frame to uint8 RGB."""
-    frame = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-    if frame is None:
-        raise ValueError(f"Could not read {path}")
-    
-    # BGR to RGB
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
+    exr_file = OpenEXR.InputFile(path)
+    header = exr_file.header()
+
+    dw = header['dataWindow']
+    width = dw.max.x - dw.min.x + 1
+    height = dw.max.y - dw.min.y + 1
+
+    # Read RGB channels
+    FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
+    channels = exr_file.channels(['R', 'G', 'B'], FLOAT)
+
+    # Convert to numpy arrays
+    r = np.frombuffer(channels[0], dtype=np.float32).reshape(height, width)
+    g = np.frombuffer(channels[1], dtype=np.float32).reshape(height, width)
+    b = np.frombuffer(channels[2], dtype=np.float32).reshape(height, width)
+
+    # Stack to HWC format
+    frame = np.stack([r, g, b], axis=2)
+
     # Sanitize floats
     np.nan_to_num(frame, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
     np.clip(frame, 0.0, 1.0, out=frame)
-    
+
     # sRGB gamma correction (linear to gamma)
     mask = frame <= 0.0031308
-    frame_pow = cv2.pow(frame, 1/2.4)
+    frame_pow = np.power(frame, 1/2.4)
     frame_pow *= 1.055
     frame_pow -= 0.055
     frame_linear = frame * 12.92
     frame = np.where(mask, frame_linear, frame_pow)
-    
+
     # Convert to uint8
     frame *= 255.0
     np.clip(frame, 0, 255, out=frame)
-    
+
     return frame.astype(np.uint8)
 
 
@@ -155,33 +167,66 @@ def _process_and_transform_frame(
     """Worker: read, transform, and save a single frame. Runs in subprocess."""
     # Read frame
     frame = _read_exr_frame(path)
-    
+
     # Convert to float and normalize to [0, 1]
     frame = frame.astype(np.float32) / 255.0
-    
-    # Resize (INTER_CUBIC)
-    frame = cv2.resize(
-        frame,
+
+    # Resize using PIL (BICUBIC interpolation)
+    img = Image.fromarray((frame * 255).astype(np.uint8))
+    img = img.resize(
         (transform_params['new_width'], transform_params['new_height']),
-        interpolation=cv2.INTER_CUBIC
+        Image.BICUBIC
     )
-    
+    frame = np.array(img).astype(np.float32) / 255.0
+
     # Normalize with ImageNet stats
     frame = (frame - transform_params['mean']) / transform_params['std']
-    
+
     # PrepareForNet: HWC -> CHW
     frame = frame.transpose(2, 0, 1)
-    
-    # Convert to tensor with shape [1, 1, C, H, W]
-    tensor = torch.from_numpy(frame).unsqueeze(0).unsqueeze(0)
-    
+
     # Save if output directory provided
     if output_dir is not None:
-        out_path = os.path.join(output_dir, f"rgb.{frame_num:04d}.pt")
-        torch.save(tensor, out_path)
+        out_path = os.path.join(output_dir, f"rgb.{frame_num:04d}.exr")
+        _write_exr_frame(out_path, frame)
         return out_path
-    
+
     return None
+
+
+def _write_exr_frame(path: str, data: np.ndarray) -> None:
+    """Write a CHW numpy array to EXR file.
+
+    Args:
+        path: Output file path
+        data: Array in CHW format (channels, height, width)
+    """
+    # Ensure float32
+    data = data.astype(np.float32)
+
+    # Get dimensions
+    channels, height, width = data.shape
+
+    # Create header
+    header = OpenEXR.Header(width, height)
+    header['channels'] = {
+        'R': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
+        'G': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
+        'B': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
+    }
+
+    # Create output file
+    exr_file = OpenEXR.OutputFile(path, header)
+
+    # Write channels (CHW -> separate channel buffers)
+    channel_data = {
+        'R': data[0].tobytes(),
+        'G': data[1].tobytes(),
+        'B': data[2].tobytes()
+    }
+
+    exr_file.writePixels(channel_data)
+    exr_file.close()
 
 
 if __name__ == "__main__":
