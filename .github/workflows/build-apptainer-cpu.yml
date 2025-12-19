@@ -1,4 +1,4 @@
-name: Build Apptainer Image
+name: Build Apptainer Image (CPU)
 
 on:
   workflow_dispatch:
