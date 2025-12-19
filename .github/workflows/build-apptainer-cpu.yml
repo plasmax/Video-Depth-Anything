@@ -22,5 +22,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: video-depth-sif
-          path: video-depth.sif
+          name: video-depth-cpu-sif
+          path: video-depth-cpu.sif
