@@ -9,16 +9,14 @@ From: ubuntu:22.04
 
     apt-get update
     apt-get install -y --no-install-recommends \
-        python3.10 python3.10-venv python3-pip \
+        python3.10 python3-pip \
         ca-certificates curl \
-        libgl1 \
         libglib2.0-0 \
         && rm -rf /var/lib/apt/lists/*
 
-    python3.10 -m pip install -U pip uv pyright[nodejs]
+    python3.10 -m pip install -U pip uv
 
-    uv pip install --system -r requirements_cpu.txt
+    uv pip install --system -r /requirements_cpu.txt
 
 %environment
     export PYTHONUNBUFFERED=1
-
