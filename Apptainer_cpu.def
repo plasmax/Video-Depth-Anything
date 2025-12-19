@@ -1,0 +1,24 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%files
+    ./requirements_cpu.txt /
+
+%post
+    set -e
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        python3.10 python3.10-venv python3-pip \
+        ca-certificates curl \
+        libgl1 \
+        libglib2.0-0 \
+        && rm -rf /var/lib/apt/lists/*
+
+    python3.10 -m pip install -U pip uv pyright[nodejs]
+
+    uv pip install --system -r requirements_cpu.txt
+
+%environment
+    export PYTHONUNBUFFERED=1
+
