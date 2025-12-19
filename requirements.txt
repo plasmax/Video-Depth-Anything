@@ -1,12 +1,7 @@
-numpy==1.23.1
-torch==2.1.1
-torchvision==0.16.1
-opencv-python
-matplotlib
-pillow
-imageio==2.19.3
-imageio-ffmpeg==0.4.7
-decord
+numpy==1.24.1
+torch==2.4.0+cu124
+torchvision==0.19.1+cu124
+opencv-python==4.11.0.86
 xformers==0.0.23
 einops==0.4.1
 easydict
