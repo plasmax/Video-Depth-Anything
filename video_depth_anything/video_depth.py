@@ -56,6 +56,9 @@ class VideoDepthAnything(nn.Module):
         self.pretrained = DINOv2(model_name=encoder)
 
         self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
+        
+        # TODO: LoRA Integration - Initialization
+        # self.apply_lora() # Method to inject LoRA layers into encoder/head
         self.metric = metric
 
     def forward(self, x):
@@ -161,3 +164,8 @@ class VideoDepthAnything(nn.Module):
 
         return np.stack(depth_list[:org_video_len], axis=0), target_fps
 
+
+    # TODO: LoRA Integration - Fine-tuning Step
+    # def fine_tune_step(self, batch, optimizer, loss_fn):
+    #     self.train()
+    #     # ... implementation ...

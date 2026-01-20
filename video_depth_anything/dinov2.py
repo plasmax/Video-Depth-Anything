@@ -327,6 +327,9 @@ class DinoVisionTransformer(nn.Module):
         else:
             return self.head(ret["x_norm_clstoken"])
 
+    # TODO: LoRA Integration - Injection
+    # Method to traverse self.blocks and replace Attention layers with LoRA-wrapped Attention
+
 
 def init_weights_vit_timm(module: nn.Module, name: str = ""):
     """ViT weight initialization, original timm impl (for reproducibility)"""

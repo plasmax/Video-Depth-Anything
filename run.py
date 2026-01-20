@@ -53,6 +53,17 @@ if __name__ == '__main__':
     video_depth_anything.load_state_dict(torch.load(f'./checkpoints/{checkpoint_name}_{args.encoder}.pth', map_location='cpu'), strict=True)
     video_depth_anything = video_depth_anything.to(DEVICE).eval()
 
+    # TODO: LoRA Integration - Fine-tuning Loop
+    # 1. Initialize LoRA adapters (see video_depth.py)
+    # 2. Setup optimizer (e.g., AdamW) for LoRA parameters only
+    # 3. Define loss function (VideoDepthLoss from loss/loss.py)
+    # 4. Run fine-tuning loop on the specific sequence
+    #    - Forward pass
+    #    - Calculate loss
+    #    - Backward pass
+    #    - Optimizer step
+    # 5. Switch back to eval mode for inference
+
     frames, target_fps = read_video_frames(args.input_video, args.max_len, args.target_fps, args.max_res)
     depths, fps = video_depth_anything.infer_video_depth(frames, target_fps, input_size=args.input_size, device=DEVICE, fp32=args.fp32)
 

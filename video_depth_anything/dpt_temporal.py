@@ -50,6 +50,9 @@ class DPTHeadTemporal(DPTHead):
                            **motion_module_kwargs)
         ])
 
+        # TODO: LoRA Integration - Temporal Modules
+        # Consider injecting LoRA into these motion_modules if temporal adaptation is needed
+
     def forward(self, out_features, patch_h, patch_w, frame_length, micro_batch_size=4, cached_hidden_state_list=None):
         out = []
         for i, x in enumerate(out_features):
