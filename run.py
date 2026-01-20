@@ -35,8 +35,18 @@ if __name__ == '__main__':
     parser.add_argument('--save_exr', action='store_true', help='save depths as exr')
     parser.add_argument('--focal-length-x', default=470.4, type=float,
                         help='Focal length along the x-axis.')
+    parser.add_argument('--focal-length-x', default=470.4, type=float,
+                        help='Focal length along the x-axis.')
     parser.add_argument('--focal-length-y', default=470.4, type=float,
                         help='Focal length along the y-axis.')
+    
+    # LoRA Fine-Tuning Arguments
+    parser.add_argument('--fine_tune', action='store_true', help='Fine-tune the model on the input video sequence using LoRA.')
+    parser.add_argument('--lora_rank', type=int, default=4, help='Rank of LoRA adapters.')
+    parser.add_argument('--train_epochs', type=int, default=10, help='Number of fine-tuning epochs.')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for fine-tuning.')
+    parser.add_argument('--alpha', type=float, default=0.5, help='Weight for spatial consistency loss.')
+    parser.add_argument('--stable_scale', type=float, default=10.0, help='Weight for temporal stability loss.')
 
     args = parser.parse_args()
 
@@ -52,19 +62,140 @@ if __name__ == '__main__':
     video_depth_anything = VideoDepthAnything(**model_configs[args.encoder], metric=args.metric)
     video_depth_anything.load_state_dict(torch.load(f'./checkpoints/{checkpoint_name}_{args.encoder}.pth', map_location='cpu'), strict=True)
     video_depth_anything = video_depth_anything.to(DEVICE).eval()
-
-    # TODO: LoRA Integration - Fine-tuning Loop
-    # 1. Initialize LoRA adapters (see video_depth.py)
-    # 2. Setup optimizer (e.g., AdamW) for LoRA parameters only
-    # 3. Define loss function (VideoDepthLoss from loss/loss.py)
-    # 4. Run fine-tuning loop on the specific sequence
-    #    - Forward pass
-    #    - Calculate loss
-    #    - Backward pass
-    #    - Optimizer step
-    # 5. Switch back to eval mode for inference
-
+    
     frames, target_fps = read_video_frames(args.input_video, args.max_len, args.target_fps, args.max_res)
+    
+    if args.fine_tune:
+        print(f"Starting LoRA fine-tuning (Rank={args.lora_rank}, Epochs={args.train_epochs}) to optimize for this specific sequence...")
+        
+        # 1. Generate Pseudo-GT (Self-Distillation)
+        print("Generating Pseudo-GT from base model...")
+        with torch.no_grad():
+            # We run inference to get the base predictions
+            # Note: infer_video_depth returns numpy array, we need it as tensor for training if possible,
+            # but for simplicity, we can just use the output as static targets.
+            # Ideally, we should run the forward pass in the loop, but memory might be an issue.
+            # Let's use the infer_video_depth to get the full consistent sequence first.
+            pseudo_depths, _ = video_depth_anything.infer_video_depth(frames, target_fps, input_size=args.input_size, device=DEVICE, fp32=args.fp32)
+            
+        # Convert frames and pseudo_depths to torch tensors for training
+        # frames: (T, H, W, 3) -> (T, 3, H, W) normalized
+        # depths: (T, H, W) -> (T, 1, H, W)
+        
+        # We need to replicate the transform logic from video_depth.py
+        from torchvision.transforms import Compose
+        from video_depth_anything.util.transform import Resize, NormalizeImage, PrepareForNet
+        import cv2
+        
+        # Reuse size logic
+        frame_height, frame_width = frames[0].shape[:2]
+        ratio = max(frame_height, frame_width) / min(frame_height, frame_width)
+        input_size = args.input_size
+        if ratio > 1.78:
+            input_size = int(input_size * 1.777 / ratio)
+            input_size = round(input_size / 14) * 14
+            
+        transform = Compose([
+            Resize(
+                width=input_size,
+                height=input_size,
+                resize_target=False,
+                keep_aspect_ratio=True,
+                ensure_multiple_of=14,
+                resize_method='lower_bound',
+                image_interpolation_method=cv2.INTER_CUBIC,
+            ),
+            NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            PrepareForNet(),
+        ])
+        
+        # Prepare dataset
+        train_images = []
+        for i in range(frames.shape[0]):
+            img = transform({'image': frames[i].astype(np.float32) / 255.0})['image'] # (3, H, W)
+            train_images.append(torch.from_numpy(img))
+        train_images = torch.stack(train_images) # (T, 3, H, W)
+        
+        # Prepare targets (Pseudo-Labels)
+        # We need to resize pseudo_depths to the same input_size usually, OR we compute loss at output size.
+        # The model outputs at input_size (patch-wise), then interpolates. 
+        # Let's compute loss at model output resolution to save memory, or interpolate targets.
+        # Simpler: Interpolate targets to train_images size.
+        train_targets = torch.from_numpy(pseudo_depths).unsqueeze(1) # (T, 1, H, W)
+        # We might need to resize targets to match the model's expected input/output if they differ slightly due to padding?
+        # Actually, the model forward returns (B, T, H_in, W_in) usually before resize.
+        # Let's check model forward:
+        # depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True) where H,W is input x shape.
+        
+        # So model output matches input tensor shape.
+        # train_targets were generated by 'infer_video_depth' which resizes BACK to original resolution.
+        # So we should resize train_targets to match train_images.
+        H_in, W_in = train_images.shape[-2:]
+        train_targets = torch.nn.functional.interpolate(train_targets, size=(H_in, W_in), mode='bilinear', align_corners=True)
+        
+        # 2. Apply LoRA
+        video_depth_anything.apply_lora(rank=args.lora_rank)
+        video_depth_anything = video_depth_anything.to(DEVICE).train() # Set to train mode (only LoRA grads enabled)
+        
+        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, video_depth_anything.parameters()), lr=args.learning_rate)
+        
+        from loss.loss import VideoDepthLoss
+        # We use existing losses. 
+        # spatial_loss (Procrustes) helps maintain structure (Consistency with Pseudo-GT).
+        # stable_loss (TemporalGradientMatching) helps reduce flickering.
+        criterion = VideoDepthLoss(alpha=args.alpha, trim=0.0, stable_scale=args.stable_scale, reduction='batch-based')
+        
+        # 3. Training Loop
+        # We process in batches of INFER_LEN usually, but for fine-tuning we might want smaller batches or full sequence if fits.
+        # Run.py default calls infer_video_depth which handles windowing.
+        # Here we need a simplified loop. Let's do a simple sliding window or batches.
+        
+        batch_size = 4 # Small batch for training
+        
+        print(f"Training for {args.train_epochs} epochs...")
+        for epoch in range(args.train_epochs):
+            total_loss = 0
+            num_batches = 0
+            
+            # Shuffle or sequential? Sequential is better for temporal loss if we pass valid masks.
+            # But the model inputs (B, T, C, H, W). Run.py uses T as sequence length.
+            # The model expects T frames.
+            # Let's assume we train on chunks of T=8 or T=16.
+            
+            T_train = 8
+            for i in range(0, len(train_images) - T_train + 1, 4): # Stride 4
+                batch_imgs = train_images[i:i+T_train].unsqueeze(0).to(DEVICE) # (1, T, 3, H, W)
+                batch_targets = train_targets[i:i+T_train].unsqueeze(0).to(DEVICE) # (1, T, 1, H, W)
+                
+                # Check valid mask (dummy all ones for now)
+                mask = torch.ones_like(batch_targets)
+                
+                optimizer.zero_grad()
+                
+                # Forward
+                # model forward expects (B, T, C, H, W)
+                preds = video_depth_anything(batch_imgs) # (1, T, H, W)
+                preds = preds.unsqueeze(2) # (1, T, 1, H, W)
+                
+                # Loss
+                loss_dict = criterion(preds, batch_targets, mask)
+                loss = loss_dict['total_loss']
+                
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+                num_batches += 1
+                
+            print(f"Epoch {epoch+1}/{args.train_epochs}, Loss: {total_loss/num_batches:.4f}")
+            
+        print("Fine-tuning completed. Switching to eval mode.")
+        video_depth_anything.eval()
+        
+        # No need to reload, weights are updated in place. (LoRA weights)
+    
+    # Run inference with the fine-tuned model
+    depths, fps = video_depth_anything.infer_video_depth(frames, target_fps, input_size=args.input_size, device=DEVICE, fp32=args.fp32)
     depths, fps = video_depth_anything.infer_video_depth(frames, target_fps, input_size=args.input_size, device=DEVICE, fp32=args.fp32)
 
     video_name = os.path.basename(args.input_video)

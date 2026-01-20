@@ -25,6 +25,7 @@ from .dpt_temporal import DPTHeadTemporal
 from .util.transform import Resize, NormalizeImage, PrepareForNet
 
 from utils.util import compute_scale_and_shift, get_interpolate_frames
+from .lora import inject_lora, mark_only_lora_as_trainable
 
 # infer settings, do not change
 INFER_LEN = 32
@@ -57,8 +58,15 @@ class VideoDepthAnything(nn.Module):
 
         self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
         
-        # TODO: LoRA Integration - Initialization
-        # self.apply_lora() # Method to inject LoRA layers into encoder/head
+    def apply_lora(self, rank=4, alpha=4):
+        # Inject LoRA into the encoder (pretrained DINOv2)
+        inject_lora(self.pretrained, rank=rank, alpha=alpha)
+        # Inject LoRA into the head (optional, but good for DPT)
+        inject_lora(self.head, rank=rank, alpha=alpha)
+        
+        # Freeze non-LoRA parameters
+        mark_only_lora_as_trainable(self)
+
         self.metric = metric
 
     def forward(self, x):
